@@ -1,92 +1,164 @@
 #!/bin/bash
 
-set -o pipefail
+set -o errexit -o pipefail
 
 source "$(dirname ${BASH_SOURCE[0]})/common.sh"
 
-chrt -b -p 0 $$
-
 [[ $# -eq 1 ]] || user_error "expected a single argument (device type)"
 [[ -n $BUILD_NUMBER ]] || user_error "expected BUILD_NUMBER in the environment"
+[[ -n $OUT ]] || user_error "expected OUT in the environment"
+
+# detect Android build system bug
+if [[ $1 == @(barbet|redfin|bramble|sunfish|coral|flame) ]]; then
+    [[ -d $OUT/vendor/firmware_mnt ]] || user_error "out/target/product/$1/vendor/firmware_mnt is missing."
+fi
+
+chrt -b -p 0 $$
 
 PERSISTENT_KEY_DIR=keys/$1
 RELEASE_OUT=out/release-$1-$BUILD_NUMBER
 
 # decrypt keys in advance for improved performance and modern algorithm support
-KEY_DIR=$(mktemp -d /dev/shm/release_keys.XXXXXXXXXX) || exit 1
-trap "rm -rf \"$KEY_DIR\"" EXIT
-cp "$PERSISTENT_KEY_DIR"/* "$KEY_DIR" || exit 1
-script/decrypt_keys.sh "$KEY_DIR" || exit 1
+KEY_DIR=$(mktemp -d /dev/shm/release_keys.XXXXXXXXXX)
+trap "rm -rf \"$KEY_DIR\" && rm -f \"$PWD/$RELEASE_OUT/keys\"" EXIT
+cp "$PERSISTENT_KEY_DIR"/* "$KEY_DIR"
+script/decrypt_keys.sh "$KEY_DIR"
 
 OLD_PATH="$PATH"
 export PATH="$PWD/prebuilts/build-tools/linux-x86/bin:$PATH"
 export PATH="$PWD/prebuilts/build-tools/path/linux-x86:$PATH"
 
-rm -rf $RELEASE_OUT || exit 1
-mkdir -p $RELEASE_OUT || exit 1
-unzip $OUT/otatools.zip -d $RELEASE_OUT/otatools || exit 1
+rm -rf $RELEASE_OUT
+mkdir -p $RELEASE_OUT
+unzip $OUT/otatools.zip -d $RELEASE_OUT
+cd $RELEASE_OUT
 
-source $RELEASE_OUT/otatools/device/common/clear-factory-images-variables.sh || exit 1
+# reproducible key path for otacerts.zip
+ln -s "$KEY_DIR" keys
+KEY_DIR=keys
 
-get_radio_image() {
-    grep "require version-$1" vendor/$2/vendor-board-info.txt | cut -d '=' -f 2 | tr '[:upper:]' '[:lower:]' || exit 1
-}
+export PATH="$PWD/bin:$PATH"
 
-if [[ $1 == crosshatch || $1 == blueline || $1 == bonito || $1 == sargo || $1 == coral || $1 == flame || $1 == sunfish || $1 == bramble || $1 == redfin ]]; then
-    BOOTLOADER=$(get_radio_image bootloader google_devices/$1)
-    RADIO=$(get_radio_image baseband google_devices/$1)
-    PREFIX=aosp_
-elif [[ $1 != hikey && $1 != hikey960 ]]; then
-    user_error "$1 is not supported by the release script"
-fi
+source device/common/clear-factory-images-variables.sh
 
 BUILD=$BUILD_NUMBER
 VERSION=$BUILD_NUMBER
 DEVICE=$1
-PRODUCT=$1
+PRODUCT=$DEVICE
+
+get_radio_image() {
+    grep "require version-$1" $ANDROID_BUILD_TOP/vendor/$2 | cut -d '=' -f 2 | tr '[:upper:]' '[:lower:]'
+}
+
+if [[ $DEVICE == @(panther|cheetah|bluejay|raven|oriole) ]]; then
+    BOOTLOADER=$(get_radio_image bootloader google_devices/$DEVICE/firmware/android-info.txt)
+    RADIO=$(get_radio_image baseband google_devices/$DEVICE/firmware/android-info.txt)
+    DISABLE_UART=true
+    DISABLE_FIPS=true
+    DISABLE_DPM=true
+elif [[ $DEVICE == @(barbet|redfin|bramble) ]]; then
+    BOOTLOADER=$(get_radio_image bootloader google_devices/$DEVICE/firmware/android-info.txt)
+    RADIO=$(get_radio_image baseband google_devices/$DEVICE/firmware/android-info.txt)
+    DISABLE_UART=true
+    ERASE_APDP=true
+elif [[ $DEVICE == @(sunfish|coral|flame) ]]; then
+    BOOTLOADER=$(get_radio_image bootloader google_devices/$DEVICE/firmware/android-info.txt)
+    RADIO=$(get_radio_image baseband google_devices/$DEVICE/firmware/android-info.txt)
+    DISABLE_UART=true
+    ERASE_APDP=true
+    ERASE_MSADP=true
+else
+    user_error "$DEVICE is not supported by the release script"
+fi
 
 TARGET_FILES=$DEVICE-target_files-$BUILD.zip
 
-if [[ $DEVICE != hikey* ]]; then
-    AVB_PKMD="$KEY_DIR/avb_pkmd.bin"
-    AVB_ALGORITHM=SHA256_RSA4096
-    [[ $(stat -c %s "$KEY_DIR/avb_pkmd.bin") -eq 520 ]] && AVB_ALGORITHM=SHA256_RSA2048
+AVB_PKMD="$KEY_DIR/avb_pkmd.bin"
+AVB_ALGORITHM=SHA256_RSA4096
 
-    if [[ $DEVICE == blueline || $DEVICE == crosshatch || $1 == bonito || $1 == sargo ]]; then
-        VERITY_SWITCHES=(--avb_vbmeta_key "$KEY_DIR/avb.pem" --avb_vbmeta_algorithm $AVB_ALGORITHM
-                         --avb_system_key "$KEY_DIR/avb.pem" --avb_system_algorithm $AVB_ALGORITHM)
-        EXTRA_OTA=(--retrofit_dynamic_partitions)
-    else
-        VERITY_SWITCHES=(--avb_vbmeta_key "$KEY_DIR/avb.pem" --avb_vbmeta_algorithm $AVB_ALGORITHM
-                         --avb_system_key "$KEY_DIR/avb.pem" --avb_system_algorithm $AVB_ALGORITHM)
-    fi
-fi
+sign_target_files_apks -o -d "$KEY_DIR" --avb_vbmeta_key "$KEY_DIR/avb.pem" --avb_vbmeta_algorithm $AVB_ALGORITHM \
+    --extra_apks AdServicesApk.apk="$KEY_DIR/releasekey" \
+    --extra_apks Bluetooth.apk="$KEY_DIR/bluetooth" \
+    --extra_apks HalfSheetUX.apk="$KEY_DIR/releasekey" \
+    --extra_apks OsuLogin.apk="$KEY_DIR/releasekey" \
+    --extra_apks SafetyCenterResources.apk="$KEY_DIR/releasekey" \
+    --extra_apks ServiceConnectivityResources.apk="$KEY_DIR/releasekey" \
+    --extra_apks ServiceUwbResources.apk="$KEY_DIR/releasekey" \
+    --extra_apks ServiceWifiResources.apk="$KEY_DIR/releasekey" \
+    --extra_apks WifiDialog.apk="$KEY_DIR/releasekey" \
+    --extra_apks com.android.adbd.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.adbd.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.adservices.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.adservices.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.apex.cts.shim.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.apex.cts.shim.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.appsearch.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.appsearch.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.art.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.art.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.art.debug.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.art.debug.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.btservices.apex="$KEY_DIR/bluetooth" \
+    --extra_apex_payload_key com.android.btservices.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.cellbroadcast.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.cellbroadcast.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.compos.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.compos.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.conscrypt.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.conscrypt.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.extservices.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.extservices.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.i18n.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.i18n.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.ipsec.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.ipsec.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.media.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.media.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.media.swcodec.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.media.swcodec.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.mediaprovider.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.mediaprovider.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.neuralnetworks.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.neuralnetworks.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.ondevicepersonalization.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.ondevicepersonalization.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.os.statsd.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.os.statsd.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.permission.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.permission.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.resolv.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.resolv.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.runtime.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.runtime.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.scheduling.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.scheduling.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.sdkext.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.sdkext.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.tethering.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.tethering.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.tzdata.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.tzdata.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.uwb.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.uwb.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.virt.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.virt.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.vndk.current.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.vndk.current.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.android.wifi.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.android.wifi.apex="$KEY_DIR/avb.pem" \
+    --extra_apks com.google.pixel.camera.hal.apex="$KEY_DIR/releasekey" \
+    --extra_apex_payload_key com.google.pixel.camera.hal.apex="$KEY_DIR/avb.pem" \
+    "$OUT/obj/PACKAGING/target_files_intermediates/$TARGET_FILES" $TARGET_FILES
 
-$RELEASE_OUT/otatools/releasetools/sign_target_files_apks -o -d "$KEY_DIR" "${VERITY_SWITCHES[@]}" \
-    out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/$PREFIX$DEVICE-target_files-$BUILD_NUMBER.zip \
-    $RELEASE_OUT/$TARGET_FILES || exit 1
+ota_from_target_files -k "$KEY_DIR/releasekey" "${EXTRA_OTA[@]}" $TARGET_FILES \
+    $DEVICE-ota_update-$BUILD.zip
+script/generate_metadata.py $DEVICE-ota_update-$BUILD.zip
 
-if [[ $DEVICE != hikey* ]]; then
-    $RELEASE_OUT/otatools/releasetools/ota_from_target_files -k "$KEY_DIR/releasekey" \
-        "${EXTRA_OTA[@]}" $RELEASE_OUT/$TARGET_FILES \
-        $RELEASE_OUT/$DEVICE-ota_update-$BUILD.zip || exit 1
-    script/generate_metadata.py $RELEASE_OUT/$DEVICE-ota_update-$BUILD.zip || exit 1
-fi
+img_from_target_files $TARGET_FILES $DEVICE-img-$BUILD.zip
 
-$RELEASE_OUT/otatools/releasetools/img_from_target_files $RELEASE_OUT/$TARGET_FILES \
-    $RELEASE_OUT/$DEVICE-img-$BUILD.zip || exit 1
-
-cd $RELEASE_OUT || exit 1
-
-if [[ $DEVICE == hikey* ]]; then
-    source otatools/device/linaro/hikey/factory-images/generate-factory-images-$DEVICE.sh || exit 1
-else
-    source otatools/device/common/generate-factory-images-common.sh || exit 1
-fi
-
-cd ../..
+source device/common/generate-factory-images-common.sh
 
 if [[ -f "$KEY_DIR/factory.sec" ]]; then
     export PATH="$OLD_PATH"
-    script/signify_prehash.sh "$KEY_DIR/factory.sec" $RELEASE_OUT/$DEVICE-factory-$BUILD_NUMBER.zip || exit 1
+    script/signify_prehash.sh "$KEY_DIR/factory.sec" $DEVICE-factory-$BUILD_NUMBER.zip
 fi
